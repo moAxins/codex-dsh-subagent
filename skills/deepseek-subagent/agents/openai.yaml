@@ -1,0 +1,4 @@
+interface:
+  display_name: "DeepSeek Subagent"
+  short_description: "Run DeepSeek Harness as a supervised Codex subagent"
+  default_prompt: "Use $deepseek-subagent to delegate this implementation plan to DeepSeek Harness and supervise the result."
