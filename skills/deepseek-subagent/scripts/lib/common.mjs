@@ -4,6 +4,7 @@ import { access, mkdir, open, readFile, readdir, rename, rm, writeFile } from 'n
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
+import { pathToFileURL } from 'node:url';
 
 export const controllerRoot = process.env.CODEX_HOME
   ? path.join(process.env.CODEX_HOME, 'deepseek-subagent')
@@ -87,11 +88,17 @@ async function pathCommand(name) {
   return found.stdout.split(/\r?\n/).map(value => value.trim()).find(Boolean);
 }
 
-async function sourceLauncher(root) {
+export async function sourceLauncher(root) {
   const cli = path.join(root, 'apps', 'cli', 'src', 'bin.ts');
-  const tsx = path.join(root, 'node_modules', 'tsx', 'dist', 'cli.mjs');
-  if (!(await exists(cli)) || !(await exists(tsx))) return undefined;
-  return { command: process.execPath, args: [tsx, cli], root };
+  const loader = path.join(root, 'node_modules', 'tsx', 'dist', 'loader.mjs');
+  const tsconfig = path.join(root, 'tsconfig.json');
+  if (!(await exists(cli)) || !(await exists(loader)) || !(await exists(tsconfig))) return undefined;
+  return {
+    command: process.execPath,
+    args: ['--import', pathToFileURL(loader).href, cli],
+    env: { TSX_TSCONFIG_PATH: tsconfig },
+    root,
+  };
 }
 
 export async function discoverHarness() {

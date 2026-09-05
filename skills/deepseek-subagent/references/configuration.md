@@ -25,4 +25,4 @@ Use a custom installed command:
 }
 ```
 
-The source checkout must contain `apps/cli/src/bin.ts`, `node_modules/tsx/dist/cli.mjs`, and its installed dependencies.
+The source checkout must contain `apps/cli/src/bin.ts`, `node_modules/tsx/dist/loader.mjs`, `tsconfig.json`, and its installed dependencies. The controller passes that `tsconfig.json` to `tsx`, so source imports resolve correctly when Harness runs inside a delegated worktree.

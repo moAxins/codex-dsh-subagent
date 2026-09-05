@@ -6,7 +6,8 @@ import path from 'node:path';
 import process from 'node:process';
 import test from 'node:test';
 import { promisify } from 'node:util';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { sourceLauncher } from '../skills/deepseek-subagent/scripts/lib/common.mjs';
 
 const exec = promisify(execFile);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -53,6 +54,24 @@ async function waitFor(env, jobId, wanted, timeout = 15_000) {
   }
   assert.fail(`Job stayed in ${result?.status}; wanted ${wanted.join(', ')}`);
 }
+
+test('source checkout launcher uses the checkout tsconfig from delegated worktrees', async t => {
+  const harnessRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-dsh-source-'));
+  const cliPath = path.join(harnessRoot, 'apps', 'cli', 'src', 'bin.ts');
+  const loaderPath = path.join(harnessRoot, 'node_modules', 'tsx', 'dist', 'loader.mjs');
+  const tsconfigPath = path.join(harnessRoot, 'tsconfig.json');
+  await mkdir(path.dirname(cliPath), { recursive: true });
+  await mkdir(path.dirname(loaderPath), { recursive: true });
+  await writeFile(cliPath, '');
+  await writeFile(loaderPath, '');
+  await writeFile(tsconfigPath, '{}\n');
+  t.after(async () => { await rm(harnessRoot, { recursive: true, force: true }); });
+
+  const launcher = await sourceLauncher(harnessRoot);
+  assert.equal(launcher.command, process.execPath);
+  assert.deepEqual(launcher.args, ['--import', pathToFileURL(loaderPath).href, cliPath]);
+  assert.equal(launcher.env.TSX_TSCONFIG_PATH, tsconfigPath);
+});
 
 test('headless lifecycle isolates a clean worktree and cleans it up', async t => {
   const ctx = await setup(t);

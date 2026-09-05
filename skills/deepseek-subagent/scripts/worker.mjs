@@ -58,7 +58,8 @@ function commandLine(command, args) {
 
 function startHarness(launcher, args, cwd) {
   const actual = commandLine(launcher.command, [...launcher.args, ...args]);
-  return spawn(actual.command, actual.args, { cwd, env: process.env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+  const env = { ...process.env, ...(launcher.env ?? {}) };
+  return spawn(actual.command, actual.args, { cwd, env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
 }
 
 function allPaths(value, key = '') {
