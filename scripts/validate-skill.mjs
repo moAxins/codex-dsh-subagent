@@ -10,7 +10,15 @@ const required = [
   'skills/deepseek-subagent/agents/openai.yaml',
   'skills/deepseek-subagent/scripts/dsh-subagent.mjs',
   'skills/deepseek-subagent/scripts/worker.mjs',
+  'skills/deepseek-subagent/scripts/lib/common.mjs',
+  'skills/deepseek-subagent/scripts/lib/policy.mjs',
+  'skills/deepseek-subagent/scripts/lib/trace.mjs',
+  'skills/deepseek-subagent/scripts/lib/evidence.mjs',
   'skills/deepseek-subagent/references/protocol.md',
+  'skills/deepseek-subagent/references/delegation.md',
+  'skills/deepseek-subagent/references/acp-supervision.md',
+  'skills/deepseek-subagent/references/evidence-verification.md',
+  'skills/deepseek-subagent/references/review-validation.md',
 ];
 
 const missing = [];

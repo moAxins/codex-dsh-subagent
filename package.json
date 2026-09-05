@@ -1,11 +1,11 @@
 {
   "name": "codex-dsh-subagent",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "workspaces": ["skills/deepseek-subagent"],
   "scripts": {
-    "test": "node --test tests/*.test.mjs",
+    "test": "node --test --test-concurrency=1 tests/*.test.mjs",
     "validate:skill": "node scripts/validate-skill.mjs",
     "check": "npm run validate:skill && npm test"
   },

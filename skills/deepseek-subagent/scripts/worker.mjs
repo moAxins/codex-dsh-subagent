@@ -9,9 +9,11 @@ import {
   client as createAcpClientApp, methods, ndJsonStream, PROTOCOL_VERSION,
 } from '@agentclientprotocol/sdk';
 import {
-  appendJsonLine, discoverHarness, isInside, jobDir, loadState,
+  appendJsonLine, discoverHarness, jobDir, loadState,
   readJson, stateFile, writeJsonAtomic,
 } from './lib/common.mjs';
+import { permissionAllowed } from './lib/policy.mjs';
+import { NOT_REQUIRED, readEvidence, requirements } from './lib/evidence.mjs';
 
 const jobFlag = process.argv.indexOf('--job');
 const jobId = jobFlag >= 0 ? process.argv[jobFlag + 1] : undefined;
@@ -41,13 +43,33 @@ async function event(type, data = {}) {
   return await writeQueue;
 }
 
+const EVIDENCE_SCHEMA_PROMPT = [
+  'Use evidence schema version 1: a JSON object with "version": 1 and an "items" array.',
+  'Each item requires: id (non-empty string); kind "fact", "citation", or "image"; selected (boolean);',
+  'useLocations (array of strings); claim (non-empty string); sourceUrl (absolute http(s) URL);',
+  'publisher (non-empty string); publishedAt (non-empty string or null);',
+  'verificationNotes (non-empty string); uncertainties (array of strings).',
+  'Image items also require imageUrl (absolute http(s) URL) and caption (non-empty string or null).',
+  'A selected item requires at least one useLocation.',
+].join('\n');
+
 function taskPrompt(packet, followup = false) {
-  return [
+  const lines = [
     followup ? 'Continue the current delegated task using this correction packet.' : 'Complete this delegated task in the current Git worktree.',
     'Keep every file change inside the current worktree. Leave useful changes uncommitted for Codex to review.',
     'Return a concise account of changes, checks, and unresolved issues.',
     JSON.stringify(packet, null, 2),
-  ].join('\n\n');
+  ];
+  if (state.evidenceRequired) {
+    lines.push(
+      '',
+      'Evidence requirements',
+      `This task requires verifiable evidence. Write the evidence file to exactly: "${state.evidencePath}".`,
+      'Do not write anything else outside the worktree.',
+      EVIDENCE_SCHEMA_PROMPT,
+    );
+  }
+  return lines.join('\n\n');
 }
 
 function commandLine(command, args) {
@@ -60,22 +82,6 @@ function startHarness(launcher, args, cwd) {
   const actual = commandLine(launcher.command, [...launcher.args, ...args]);
   const env = { ...process.env, ...(launcher.env ?? {}) };
   return spawn(actual.command, actual.args, { cwd, env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
-}
-
-function allPaths(value, key = '') {
-  const found = [];
-  if (typeof value === 'string' && /(^|_)(path|cwd|location)$/i.test(key)) found.push(value);
-  else if (Array.isArray(value)) for (const item of value) found.push(...allPaths(item, key));
-  else if (value && typeof value === 'object') for (const [childKey, child] of Object.entries(value)) found.push(...allPaths(child, childKey));
-  return found;
-}
-
-function permissionAllowed(toolCall, worktreePath) {
-  const kind = toolCall?.kind ?? 'other';
-  if (['read', 'search', 'fetch'].includes(kind)) return true;
-  const paths = allPaths(toolCall);
-  if (paths.length === 0) return false;
-  return paths.every(value => isInside(worktreePath, path.isAbsolute(value) ? value : path.join(worktreePath, value)));
 }
 
 async function nextCommands() {
@@ -97,10 +103,23 @@ async function acknowledge(command, ok, extra = {}) {
   await rename(command.processingFile, `${command.processingFile}.done`);
 }
 
+async function currentEvidenceStatus() {
+  if (!state.evidenceRequired) return NOT_REQUIRED;
+  return (await readEvidence(state.evidencePath, state.evidenceKinds)).status;
+}
+
+async function settleEvidence() {
+  if (state.mode !== 'acp') return;
+  const status = await currentEvidenceStatus();
+  await mutate({ evidenceStatus: status });
+  await event('evidence', { status, path: state.evidencePath });
+}
+
 async function runHeadless(launcher, packet) {
   await mutate({ status: 'running', harnessSource: launcher.source });
   await event('started', { mode: 'headless', harnessSource: launcher.source });
   const child = startHarness(launcher, ['--profile', 'headless', taskPrompt(packet)], state.worktreePath);
+  await mutate({ harnessPid: child.pid });
   let stdout = ''; let stderr = '';
   child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
   child.stdout.on('data', chunk => { stdout += chunk; });
@@ -111,6 +130,7 @@ async function runHeadless(launcher, packet) {
     child.on('close', code => resolve({ code }));
   });
   clearTimeout(timeout);
+  await mutate({ harnessPid: null });
   if (Date.now() - new Date(state.createdAt).getTime() >= state.timeoutMs) {
     await mutate({ status: 'timed_out', result: stdout.trim() || null, error: 'Headless task timed out.' });
     await event('timed_out');
@@ -125,19 +145,28 @@ async function runHeadless(launcher, packet) {
 
 async function runAcp(launcher, firstPacket) {
   const child = startHarness(launcher, ['--profile', 'acp'], state.worktreePath);
+  await mutate({ harnessPid: child.pid });
   const stderrLog = createWriteStream(path.join(dir, 'harness.stderr.log'), { flags: 'a' });
   child.stderr.pipe(stderrLog);
   let output = '';
+  const toolCalls = new Map();
   const clientApp = createAcpClientApp({ name: 'codex-dsh-subagent' })
     .onNotification(methods.client.session.update, async ({ params }) => {
       const update = params.update;
+      if (update.toolCallId) {
+        toolCalls.set(update.toolCallId, { ...(toolCalls.get(update.toolCallId) ?? {}), ...update });
+      }
       if (update.sessionUpdate === 'agent_message_chunk' && update.content?.type === 'text') output += update.content.text;
       await event('acp_update', update);
     })
     .onRequest(methods.client.session.requestPermission, async ({ params }) => {
-      const allowed = permissionAllowed(params.toolCall, state.worktreePath);
+      const toolCall = { ...(toolCalls.get(params.toolCall.toolCallId) ?? {}), ...params.toolCall };
+      const allowed = permissionAllowed(toolCall, {
+        worktreePath: state.worktreePath,
+        evidencePath: state.evidenceRequired ? state.evidencePath : undefined,
+      });
       const option = allowed && params.options.find(value => value.kind === 'allow_once' || value.kind === 'allow_always');
-      await event('permission', { toolCall: params.toolCall, allowed: Boolean(option) });
+      await event('permission', { toolCall, allowed: Boolean(option) });
       return option ? { outcome: { outcome: 'selected', optionId: option.optionId } } : { outcome: { outcome: 'cancelled' } };
     });
   const connection = clientApp.connect(ndJsonStream(Writable.toWeb(child.stdin), Readable.toWeb(child.stdout)));
@@ -150,16 +179,16 @@ async function runAcp(launcher, firstPacket) {
   let active;
   let shuttingDown = false;
   let deadline = Date.now() + state.timeoutMs;
-  const startPrompt = packet => {
+  const preparePrompt = async (packet, correction = false) => {
     output = '';
-    mutate({ status: 'running', result: null, error: null });
-    event('prompt_started', { packet });
-    return agent.request(methods.agent.session.prompt, {
+    await mutate({ status: 'running', result: null, error: null });
+    await event('prompt_started', { packet, correction });
+    return {
       sessionId: created.sessionId,
-      prompt: [{ type: 'text', text: taskPrompt(packet, packet !== firstPacket) }],
-    });
+      prompt: [{ type: 'text', text: taskPrompt(packet, correction) }],
+    };
   };
-  active = startPrompt(firstPacket);
+  active = agent.request(methods.agent.session.prompt, await preparePrompt(firstPacket));
 
   while (!shuttingDown) {
     for (const name of await nextCommands()) {
@@ -175,7 +204,9 @@ async function runAcp(launcher, firstPacket) {
       } else if (command.type === 'followup') {
         if (active) await acknowledge(command, false, { error: 'Wait for the active prompt to settle before followup.' });
         else {
-          active = startPrompt(command.data.packet);
+          await mutate({ corrections: (state.corrections ?? 0) + 1 });
+          const prompt = await preparePrompt(command.data.packet, true);
+          active = agent.request(methods.agent.session.prompt, prompt);
           deadline = Date.now() + state.timeoutMs;
           await acknowledge(command, true, { status: 'running', sessionId: created.sessionId });
         }
@@ -196,16 +227,19 @@ async function runAcp(launcher, firstPacket) {
         if (settled.error) {
           await mutate({ status: 'failed', result: output || null, error: settled.error.message });
           await event('prompt_failed', { error: settled.error.message });
+          await settleEvidence();
         } else {
           const stopReason = settled.value.stopReason;
           const status = stopReason === 'cancelled' ? 'cancelled' : 'idle';
           await mutate({ status, result: output, error: null, stopReason });
           await event('prompt_finished', { stopReason, result: output });
+          await settleEvidence();
         }
       } else if (Date.now() >= deadline) {
         await agent.notify(methods.agent.session.cancel, { sessionId: created.sessionId });
         await mutate({ status: 'timed_out', result: output || null, error: 'ACP prompt timed out.' });
         await event('timed_out');
+        await settleEvidence();
         active = undefined;
       }
     } else await delay(100);
@@ -213,18 +247,26 @@ async function runAcp(launcher, firstPacket) {
 
   try { await agent.request(methods.agent.session.close, { sessionId: created.sessionId }); } catch { /* Best effort. */ }
   child.kill(); stderrLog.end();
-  await mutate({ status: 'stopped' });
+  await mutate({ status: 'stopped', harnessPid: null });
   await event('stopped');
 }
 
 async function main() {
   await delay(100);
   state = await loadState(jobId);
-  await mutate({ workerPid: process.pid });
   const packet = await readJson(path.join(dir, 'task.json'));
+  const evidence = requirements(packet);
+  await mutate({
+    workerPid: process.pid,
+    evidenceRequired: evidence.required,
+    evidenceKinds: evidence.kinds,
+    evidenceStatus: evidence.required ? 'missing' : NOT_REQUIRED,
+  });
   const launcher = await discoverHarness();
-  if (state.mode === 'headless') await runHeadless(launcher, packet);
-  else await runAcp(launcher, packet);
+  if (state.mode === 'headless') {
+    if (evidence.required) throw new Error('Evidence-required tasks must run in ACP mode, not headless.');
+    await runHeadless(launcher, packet);
+  } else await runAcp(launcher, packet);
 }
 
 main().catch(async error => {
