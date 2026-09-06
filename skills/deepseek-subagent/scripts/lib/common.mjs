@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { pathToFileURL } from 'node:url';
+import { retryTransientFileOperation } from './reliability.mjs';
 
 export const controllerRoot = process.env.CODEX_HOME
   ? path.join(process.env.CODEX_HOME, 'deepseek-subagent')
@@ -22,8 +23,15 @@ export async function readJson(file) { return JSON.parse(await readFile(file, 'u
 export async function writeJsonAtomic(file, value) {
   await mkdir(path.dirname(file), { recursive: true });
   const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
-  await writeFile(temp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-  await rename(temp, file);
+  const content = `${JSON.stringify(value, null, 2)}\n`;
+  try {
+    await retryTransientFileOperation(async () => {
+      await writeFile(temp, content, 'utf8');
+      await rename(temp, file);
+    });
+  } finally {
+    await retryTransientFileOperation(() => rm(temp, { force: true })).catch(() => undefined);
+  }
 }
 
 export async function appendJsonLine(file, value) {

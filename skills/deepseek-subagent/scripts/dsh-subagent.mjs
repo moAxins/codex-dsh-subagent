@@ -2,7 +2,7 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { closeSync, openSync } from 'node:fs';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
@@ -10,9 +10,17 @@ import {
   acquireLock, ensureRoots, git, isTerminal, jobDir, jobsRoot, listJobIds, loadState,
   parseArgs, processAlive, readJson, stateFile, worktreesRoot, writeJsonAtomic,
 } from './lib/common.mjs';
+import {
+  assertMode, CLEANUP_GRACE_TIMEOUT_MS, COMMAND_ACK_TIMEOUT_MS, DEFAULT_MODE,
+  FORCE_STOP_TIMEOUT_MS, MAX_CONCURRENT_JOBS, validateTask,
+} from './lib/policy.mjs';
+import { NOT_REQUIRED, readEvidence, requirements } from './lib/evidence.mjs';
+import { summarize } from './lib/trace.mjs';
 
 const workerFile = path.join(path.dirname(fileURLToPath(import.meta.url)), 'worker.mjs');
 const activeStates = new Set(['starting', 'running', 'idle', 'cancelling', 'cancelled']);
+const ARTIFACTS_DIR = 'artifacts';
+const EVIDENCE_FILE = 'evidence.json';
 
 function required(options, name) {
   const value = options[name];
@@ -22,10 +30,8 @@ function required(options, name) {
 
 async function taskPacket(file) {
   const packet = await readJson(path.resolve(file));
-  const strings = ['goal'];
-  const arrays = ['plan', 'constraints', 'acceptanceCriteria', 'relevantPaths', 'requiredChecks'];
-  for (const field of strings) if (typeof packet[field] !== 'string' || !packet[field].trim()) throw new Error(`Task field ${field} must be a non-empty string.`);
-  for (const field of arrays) if (!Array.isArray(packet[field]) || !packet[field].every(value => typeof value === 'string')) throw new Error(`Task field ${field} must be a string array.`);
+  validateTask(packet);
+  requirements(packet); // Validates optional evidenceRequirements when present.
   return packet;
 }
 
@@ -40,11 +46,17 @@ async function activeJobCount() {
   return count;
 }
 
+function evidencePaths(dir) {
+  const artifactsPath = path.join(dir, ARTIFACTS_DIR);
+  return { artifactsPath, evidencePath: path.join(artifactsPath, EVIDENCE_FILE) };
+}
+
 async function spawnJob(options) {
   const repoInput = path.resolve(required(options, 'repo'));
-  const mode = options.mode ?? 'acp';
-  if (!['acp', 'headless'].includes(mode)) throw new Error('--mode must be acp or headless.');
+  const mode = assertMode(options.mode ?? DEFAULT_MODE);
   const packet = await taskPacket(required(options, 'task'));
+  const evidence = requirements(packet);
+  if (mode === 'headless' && evidence.required) throw new Error('Evidence-required tasks must run in ACP mode, not headless.');
   const timeoutMs = Number(options['timeout-ms'] ?? 3_600_000);
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000) throw new Error('--timeout-ms must be an integer of at least 1000.');
 
@@ -53,17 +65,21 @@ async function spawnJob(options) {
   const jobId = randomUUID();
   const dir = jobDir(jobId);
   const worktreePath = path.join(worktreesRoot, jobId);
+  const { artifactsPath, evidencePath } = evidencePaths(dir);
 
   return await acquireLock('capacity', async () => {
-    if (await activeJobCount() >= 3) throw new Error('The three-job concurrency limit is already in use.');
+    if (await activeJobCount() >= MAX_CONCURRENT_JOBS) throw new Error('The three-job concurrency limit is already in use.');
     await mkdir(path.join(dir, 'commands'), { recursive: true });
     await mkdir(path.join(dir, 'acks'), { recursive: true });
+    await mkdir(artifactsPath, { recursive: true });
     await writeJsonAtomic(path.join(dir, 'task.json'), packet);
     await git(['worktree', 'add', '--detach', worktreePath, 'HEAD'], repo);
     const initial = {
-      version: 1, jobId, mode, status: 'starting', repo, worktreePath, timeoutMs,
+      version: 2, jobId, mode, status: 'starting', repo, worktreePath, timeoutMs,
+      artifactsPath, evidencePath, evidenceRequired: evidence.required, evidenceKinds: evidence.kinds,
+      evidenceStatus: evidence.required ? 'missing' : NOT_REQUIRED, corrections: 0,
       createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
-      workerPid: null, sessionId: null, eventSeq: 0, result: null, error: null,
+      workerPid: null, harnessPid: null, sessionId: null, eventSeq: 0, result: null, error: null,
     };
     await writeJsonAtomic(stateFile(jobId), initial);
 
@@ -79,7 +95,7 @@ async function spawnJob(options) {
     initial.workerPid = child.pid;
     initial.updatedAt = new Date().toISOString();
     await writeJsonAtomic(stateFile(jobId), initial);
-    return { jobId, mode, status: initial.status, worktreePath, repo };
+    return { jobId, mode, status: initial.status, worktreePath, repo, artifactsPath, evidencePath, evidenceRequired: evidence.required };
   });
 }
 
@@ -98,16 +114,22 @@ async function waitJob(options) {
   do {
     const state = await loadState(jobId);
     const events = await readEvents(jobId, after);
+    const lastSeq = events.at(-1)?.seq ?? 0;
+    const latestSeq = Math.max(state.eventSeq ?? 0, lastSeq);
+    const nextAfter = lastSeq || after;
     if (events.length || isTerminal(state.status) || state.status === 'idle' || state.status === 'cancelled') {
-      return { jobId, status: state.status, sessionId: state.sessionId, events, nextAfter: events.at(-1)?.seq ?? after };
+      return { jobId, status: state.status, sessionId: state.sessionId, latestSeq, events, nextAfter };
     }
     await new Promise(resolve => setTimeout(resolve, 150));
   } while (Date.now() < deadline);
   const state = await loadState(jobId);
-  return { jobId, status: state.status, sessionId: state.sessionId, events: [], nextAfter: after, timedOut: true };
+  const events = await readEvents(jobId, after);
+  const lastSeq = events.at(-1)?.seq ?? 0;
+  const latestSeq = Math.max(state.eventSeq ?? 0, lastSeq);
+  return { jobId, status: state.status, sessionId: state.sessionId, latestSeq, events, nextAfter: lastSeq || after, timedOut: true };
 }
 
-async function sendCommand(jobId, type, data = {}, waitMs = 10_000) {
+async function sendCommand(jobId, type, data = {}, waitMs = COMMAND_ACK_TIMEOUT_MS) {
   const state = await loadState(jobId);
   if (!processAlive(state.workerPid)) throw new Error(`Job worker is not running; current status is ${state.status}.`);
   const commandId = randomUUID();
@@ -126,7 +148,23 @@ async function resultJob(jobId) {
   const state = await loadState(jobId);
   const status = await git(['status', '--porcelain=v1'], state.worktreePath, true);
   const diff = await git(['diff', '--stat', '--'], state.worktreePath, true);
-  return { ...state, dirty: Boolean(status.stdout.trim()), gitStatus: status.stdout, diffStat: diff.stdout, events: await readEvents(jobId, 0) };
+  const events = await readEvents(jobId, 0);
+  const eventSeq = Math.max(state.eventSeq ?? 0, events.at(-1)?.seq ?? 0);
+  const trace = summarize(events, eventSeq);
+  const evidence = state.evidenceRequired
+    ? await readEvidence(state.evidencePath, state.evidenceKinds)
+    : { status: NOT_REQUIRED, schemaVersion: null, items: [], errors: [] };
+  return {
+    ...state,
+    dirty: Boolean(status.stdout.trim()), gitStatus: status.stdout, diffStat: diff.stdout,
+    events,
+    trace,
+    correctionCount: trace.corrections.count,
+    correctionLimitReached: trace.corrections.limitReached,
+    maxCorrections: trace.corrections.max,
+    evidenceStatus: evidence.status,
+    evidence,
+  };
 }
 
 async function cleanupJob(jobId) {
@@ -134,9 +172,21 @@ async function cleanupJob(jobId) {
   const status = await git(['status', '--porcelain=v1'], state.worktreePath, true);
   if (status.stdout.trim()) throw new Error(`Worktree is dirty and was preserved at ${state.worktreePath}.`);
   if (processAlive(state.workerPid)) {
-    await sendCommand(jobId, 'shutdown', {}, 10_000);
-    const deadline = Date.now() + 10_000;
+    try {
+      await sendCommand(jobId, 'shutdown', {}, CLEANUP_GRACE_TIMEOUT_MS);
+    } catch (error) {
+      if (!error.message.includes('Timed out waiting for shutdown acknowledgement') && processAlive(state.workerPid)) throw error;
+    }
+    let deadline = Date.now() + CLEANUP_GRACE_TIMEOUT_MS;
     while (Date.now() < deadline && processAlive(state.workerPid)) await new Promise(resolve => setTimeout(resolve, 100));
+    if (processAlive(state.workerPid)) {
+      for (const pid of [state.harnessPid, state.workerPid]) {
+        if (!processAlive(pid)) continue;
+        try { process.kill(pid); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+      }
+      deadline = Date.now() + FORCE_STOP_TIMEOUT_MS;
+      while (Date.now() < deadline && processAlive(state.workerPid)) await new Promise(resolve => setTimeout(resolve, 100));
+    }
     if (processAlive(state.workerPid)) throw new Error('Worker did not stop; the worktree was preserved.');
   }
   await git(['worktree', 'remove', state.worktreePath], state.repo);
