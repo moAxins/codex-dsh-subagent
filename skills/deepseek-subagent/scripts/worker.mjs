@@ -14,33 +14,32 @@ import {
 } from './lib/common.mjs';
 import { permissionAllowed } from './lib/policy.mjs';
 import { NOT_REQUIRED, readEvidence, requirements } from './lib/evidence.mjs';
+import { createRecoverableSerialQueue } from './lib/reliability.mjs';
 
 const jobFlag = process.argv.indexOf('--job');
 const jobId = jobFlag >= 0 ? process.argv[jobFlag + 1] : undefined;
 if (!jobId) throw new Error('Worker requires --job.');
 const dir = jobDir(jobId);
 let state;
-let writeQueue = Promise.resolve();
+const enqueueWrite = createRecoverableSerialQueue();
 
 function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
 async function mutate(changes) {
-  writeQueue = writeQueue.then(async () => {
+  return await enqueueWrite(async () => {
     state = { ...state, ...changes, updatedAt: new Date().toISOString() };
     await writeJsonAtomic(stateFile(jobId), state);
   });
-  return await writeQueue;
 }
 
 async function event(type, data = {}) {
-  writeQueue = writeQueue.then(async () => {
+  return await enqueueWrite(async () => {
     state.eventSeq += 1;
     const record = { seq: state.eventSeq, time: new Date().toISOString(), type, data };
     await appendJsonLine(path.join(dir, 'events.ndjson'), record);
     state.updatedAt = record.time;
     await writeJsonAtomic(stateFile(jobId), state);
   });
-  return await writeQueue;
 }
 
 const EVIDENCE_SCHEMA_PROMPT = [
@@ -270,6 +269,7 @@ async function main() {
 }
 
 main().catch(async error => {
+  console.error(error.stack ?? error.message);
   try {
     if (!state) state = await loadState(jobId);
     await mutate({ status: 'failed', error: error.stack ?? error.message });

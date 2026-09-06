@@ -13,7 +13,10 @@ Local maintainability upgrade for the `deepseek-subagent` Codex Skill.
 - Added evidence schema v1 validation with `not_required`, `missing`, `invalid`, and `ready` statuses.
 - Added sequence-based trace completeness: `wait` returns `latestSeq` and `nextAfter`; `result` returns a deterministic trace summary, `correctionCount`, `evidenceStatus`, and parsed evidence.
 - Preserved existing lifecycle, concurrency, timeout, permission, worktree isolation, and dirty-worktree cleanup protection.
-- Validated with `npm run check` (19 tests), the official Skill validator, copy lint, and a real ACP evidence job. The real job produced 123 contiguous events, reached `idle` after two supervised corrections, returned `evidenceStatus: ready`, and kept its delegated worktree clean.
+- Added bounded retries for transient state-file locks and a recoverable serial write queue, so a failed write can be followed by a persisted `failed` state and error event.
+- Added explicit fake-Headless stdout flushing, tracked test-job teardown, and timeout diagnostics with process liveness, recent events, and stderr tails.
+- Validated the 23-test suite across ten consecutive Windows and Node 24 runs (230 test instances), with every run completing successfully.
+- Validated with `npm run check` (23 tests), the official Skill validator, copy lint, and a real ACP evidence job. The real job produced 123 contiguous events, reached `idle` after two supervised corrections, returned `evidenceStatus: ready`, and kept its delegated worktree clean.
 
 ## [0.1.0] - Initial release
 

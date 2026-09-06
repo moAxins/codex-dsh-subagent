@@ -7,7 +7,7 @@ import process from 'node:process';
 import test from 'node:test';
 import { promisify } from 'node:util';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { sourceLauncher } from '../skills/deepseek-subagent/scripts/lib/common.mjs';
+import { processAlive, sourceLauncher } from '../skills/deepseek-subagent/scripts/lib/common.mjs';
 
 const exec = promisify(execFile);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -21,6 +21,7 @@ async function setup(t, fake = fakeHeadless) {
   const base = await mkdtemp(path.join(os.tmpdir(), 'codex-dsh-test-'));
   const repo = path.join(base, 'repo');
   const home = path.join(base, 'codex-home');
+  const jobs = new Set();
   await mkdir(repo); await mkdir(path.join(home, 'deepseek-subagent'), { recursive: true });
   await git(repo, 'init', '-b', 'main');
   await git(repo, 'config', 'user.name', 'Test User');
@@ -30,8 +31,17 @@ async function setup(t, fake = fakeHeadless) {
   await writeFile(path.join(home, 'deepseek-subagent', 'config.json'), JSON.stringify({ command: process.execPath, args: [fake] }));
   const env = { ...process.env, CODEX_HOME: home };
   delete env.DEEPSEEK_HARNESS_ROOT;
-  t.after(async () => { await rm(base, { recursive: true, force: true }); });
-  return { base, repo, home, env };
+  const ctx = { base, repo, home, env, jobs };
+  t.after(async () => {
+    const errors = [];
+    for (const jobId of [...jobs]) {
+      try { await discardAndCleanupTestJob(ctx, jobId); }
+      catch (error) { errors.push(new Error(`Failed to clean test job ${jobId}: ${error.message}`)); }
+    }
+    await rm(base, { recursive: true, force: true });
+    if (errors.length) throw new AggregateError(errors, 'One or more test jobs could not be cleaned.');
+  });
+  return ctx;
 }
 
 async function packet(base, goal, options = {}) {
@@ -47,6 +57,52 @@ async function cli(env, ...args) {
   return JSON.parse(result.stdout);
 }
 
+async function spawnTracked(ctx, ...args) {
+  const result = await cli(ctx.env, 'spawn', ...args);
+  ctx.jobs.add(result.jobId);
+  return result;
+}
+
+async function cleanupTracked(ctx, jobId) {
+  const result = await cli(ctx.env, 'cleanup', '--job', jobId);
+  ctx.jobs.delete(jobId);
+  return result;
+}
+
+async function discardAndCleanupTestJob(ctx, jobId) {
+  try { return await cleanupTracked(ctx, jobId); }
+  catch (firstError) {
+    let state;
+    try {
+      state = JSON.parse(await readFile(path.join(ctx.home, 'deepseek-subagent', 'jobs', jobId, 'state.json'), 'utf8'));
+    } catch { /* Cleanup retry reports the useful error. */ }
+    if (state?.worktreePath) {
+      await git(state.worktreePath, 'reset', '--hard', 'HEAD').catch(() => undefined);
+      await git(state.worktreePath, 'clean', '-fd').catch(() => undefined);
+    }
+    try { return await cleanupTracked(ctx, jobId); }
+    catch (retryError) { throw new AggregateError([firstError, retryError], `Cleanup failed twice for ${jobId}.`); }
+  }
+}
+
+async function readTail(file, count = 12) {
+  try { return (await readFile(file, 'utf8')).split(/\r?\n/).filter(Boolean).slice(-count); }
+  catch (error) { return error.code === 'ENOENT' ? [] : [`<read failed: ${error.message}>`]; }
+}
+
+async function jobDiagnostics(env, jobId, state) {
+  const dir = path.join(env.CODEX_HOME, 'deepseek-subagent', 'jobs', jobId);
+  return {
+    jobId,
+    state,
+    workerAlive: processAlive(state?.workerPid),
+    harnessAlive: processAlive(state?.harnessPid),
+    lastEvents: await readTail(path.join(dir, 'events.ndjson')),
+    workerStderr: await readTail(path.join(dir, 'worker.stderr.log')),
+    harnessStderr: await readTail(path.join(dir, 'harness.stderr.log')),
+  };
+}
+
 async function waitFor(env, jobId, wanted, timeout = 60_000) {
   const deadline = Date.now() + timeout;
   let result;
@@ -57,7 +113,8 @@ async function waitFor(env, jobId, wanted, timeout = 60_000) {
     if (wanted.includes(result?.status)) return result;
     await new Promise(resolve => setTimeout(resolve, 100));
   }
-  assert.fail(`Job stayed in ${result?.status}; wanted ${wanted.join(', ')}`);
+  const diagnostics = await jobDiagnostics(env, jobId, result);
+  assert.fail(`Job stayed in ${result?.status}; wanted ${wanted.join(', ')}\n${JSON.stringify(diagnostics, null, 2)}`);
 }
 
 test('source checkout launcher uses the checkout tsconfig from delegated worktrees', async t => {
@@ -81,7 +138,7 @@ test('source checkout launcher uses the checkout tsconfig from delegated worktre
 test('headless lifecycle isolates a clean worktree and cleans it up', async t => {
   const ctx = await setup(t);
   const task = await packet(ctx.base, 'analyze');
-  const spawned = await cli(ctx.env, 'spawn', '--repo', ctx.repo, '--mode', 'headless', '--task', task);
+  const spawned = await spawnTracked(ctx, '--repo', ctx.repo, '--mode', 'headless', '--task', task);
   assert.notEqual(path.resolve(spawned.worktreePath), path.resolve(ctx.repo));
   assert.equal(spawned.evidenceRequired, false);
   await waitFor(ctx.env, spawned.jobId, ['completed']);
@@ -91,28 +148,36 @@ test('headless lifecycle isolates a clean worktree and cleans it up', async t =>
   assert.equal(result.evidenceStatus, 'not_required');
   assert.equal(result.correctionCount, 0);
   assert.equal(result.trace.complete, true);
-  const cleaned = await cli(ctx.env, 'cleanup', '--job', spawned.jobId);
+  const cleaned = await cleanupTracked(ctx, spawned.jobId);
   assert.equal(cleaned.status, 'cleaned');
+});
+
+test('test teardown cleans a completed job left registered', async t => {
+  const ctx = await setup(t);
+  const task = await packet(ctx.base, 'leave this completed job for the teardown hook');
+  const spawned = await spawnTracked(ctx, '--repo', ctx.repo, '--mode', 'headless', '--task', task);
+  await waitFor(ctx.env, spawned.jobId, ['completed']);
+  assert.equal(ctx.jobs.has(spawned.jobId), true);
 });
 
 test('dirty delegated changes are preserved by cleanup', async t => {
   const ctx = await setup(t);
   const task = await packet(ctx.base, '[EDIT]');
-  const spawned = await cli(ctx.env, 'spawn', '--repo', ctx.repo, '--mode', 'headless', '--task', task);
+  const spawned = await spawnTracked(ctx, '--repo', ctx.repo, '--mode', 'headless', '--task', task);
   await waitFor(ctx.env, spawned.jobId, ['completed']);
   const result = await cli(ctx.env, 'result', '--job', spawned.jobId);
   assert.equal(result.dirty, true);
-  await assert.rejects(cli(ctx.env, 'cleanup', '--job', spawned.jobId), /dirty and was preserved/);
+  await assert.rejects(cleanupTracked(ctx, spawned.jobId), /dirty and was preserved/);
   assert.equal(await readFile(path.join(spawned.worktreePath, 'delegated.txt'), 'utf8'), 'uncommitted delegated change\n');
   await rm(path.join(spawned.worktreePath, 'delegated.txt'));
-  await cli(ctx.env, 'cleanup', '--job', spawned.jobId);
+  await cleanupTracked(ctx, spawned.jobId);
 });
 
 test('ACP supports interrupt, correction, semantic events, and outside-write rejection', async t => {
   const ctx = await setup(t, fakeAcp);
   const first = await packet(ctx.base, '[HANG] [PERMISSION]');
   const correction = await packet(ctx.base, 'continue correctly');
-  const spawned = await cli(ctx.env, 'spawn', '--repo', ctx.repo, '--mode', 'acp', '--task', first);
+  const spawned = await spawnTracked(ctx, '--repo', ctx.repo, '--mode', 'acp', '--task', first);
   await waitFor(ctx.env, spawned.jobId, ['running']);
   await cli(ctx.env, 'interrupt', '--job', spawned.jobId);
   await waitFor(ctx.env, spawned.jobId, ['cancelled']);
@@ -124,33 +189,33 @@ test('ACP supports interrupt, correction, semantic events, and outside-write rej
   assert.equal(result.correctionCount, 1);
   assert.ok(result.events.some(value => value.type === 'permission' && value.data.allowed === false));
   assert.ok(result.events.some(value => value.type === 'interrupt_requested'));
-  await cli(ctx.env, 'cleanup', '--job', spawned.jobId);
+  await cleanupTracked(ctx, spawned.jobId);
 });
 
 test('concurrency is capped at three active jobs', async t => {
   const ctx = await setup(t);
   const task = await packet(ctx.base, '[SLEEP]');
   const jobs = [];
-  for (let index = 0; index < 3; index += 1) jobs.push(await cli(ctx.env, 'spawn', '--repo', ctx.repo, '--mode', 'headless', '--task', task));
-  await assert.rejects(cli(ctx.env, 'spawn', '--repo', ctx.repo, '--mode', 'headless', '--task', task), /three-job concurrency limit/);
+  for (let index = 0; index < 3; index += 1) jobs.push(await spawnTracked(ctx, '--repo', ctx.repo, '--mode', 'headless', '--task', task));
+  await assert.rejects(spawnTracked(ctx, '--repo', ctx.repo, '--mode', 'headless', '--task', task), /three-job concurrency limit/);
   for (const job of jobs) {
     await waitFor(ctx.env, job.jobId, ['completed']);
-    await cli(ctx.env, 'cleanup', '--job', job.jobId);
+    await cleanupTracked(ctx, job.jobId);
   }
 });
 
 test('headless timeout is recorded', async t => {
   const ctx = await setup(t);
   const task = await packet(ctx.base, '[TIMEOUT]');
-  const spawned = await cli(ctx.env, 'spawn', '--repo', ctx.repo, '--mode', 'headless', '--task', task, '--timeout-ms', '1000');
+  const spawned = await spawnTracked(ctx, '--repo', ctx.repo, '--mode', 'headless', '--task', task, '--timeout-ms', '1000');
   await waitFor(ctx.env, spawned.jobId, ['timed_out'], 10_000);
-  await cli(ctx.env, 'cleanup', '--job', spawned.jobId);
+  await cleanupTracked(ctx, spawned.jobId);
 });
 
 test('ACP trace is captured ordered, incrementally, and without loss or duplication', async t => {
   const ctx = await setup(t, fakeAcp);
   const task = await packet(ctx.base, 'trace everything');
-  const spawned = await cli(ctx.env, 'spawn', '--repo', ctx.repo, '--mode', 'acp', '--task', task);
+  const spawned = await spawnTracked(ctx, '--repo', ctx.repo, '--mode', 'acp', '--task', task);
   const seen = new Map();
   let maxSeen = 0;
   const collect = async poll => {
@@ -213,13 +278,13 @@ test('ACP trace is captured ordered, incrementally, and without loss or duplicat
     .map(event => event.data.content.text);
   assert.deepEqual(thoughts, ['reasoning-1-1', 'reasoning-1-2']);
 
-  await cli(ctx.env, 'cleanup', '--job', spawned.jobId);
+  await cleanupTracked(ctx, spawned.jobId);
 });
 
 test('evidence-required ACP job validates ready evidence and scopes permission to the exact file', async t => {
   const ctx = await setup(t, fakeAcp);
   const task = await packet(ctx.base, '[EVIDENCE] [PERMISSION] prove the change', { evidence: true });
-  const spawned = await cli(ctx.env, 'spawn', '--repo', ctx.repo, '--mode', 'acp', '--task', task);
+  const spawned = await spawnTracked(ctx, '--repo', ctx.repo, '--mode', 'acp', '--task', task);
   assert.equal(spawned.evidenceRequired, true);
   assert.ok(spawned.evidencePath.endsWith(path.join('artifacts', 'evidence.json')));
   await waitFor(ctx.env, spawned.jobId, ['idle']);
@@ -244,33 +309,33 @@ test('evidence-required ACP job validates ready evidence and scopes permission t
     'permission must be refused for writes outside the worktree');
 
   assert.equal(result.dirty, false, 'evidence must never dirty the delegated worktree');
-  await cli(ctx.env, 'cleanup', '--job', spawned.jobId);
+  await cleanupTracked(ctx, spawned.jobId);
 });
 
 test('evidence-required ACP job reports invalid and missing evidence', async t => {
   const ctx = await setup(t, fakeAcp);
   const invalidTask = await packet(ctx.base, '[INVALID-EVIDENCE] write broken evidence', { evidence: true });
-  const invalid = await cli(ctx.env, 'spawn', '--repo', ctx.repo, '--mode', 'acp', '--task', invalidTask);
+  const invalid = await spawnTracked(ctx, '--repo', ctx.repo, '--mode', 'acp', '--task', invalidTask);
   await waitFor(ctx.env, invalid.jobId, ['idle']);
   const invalidResult = await cli(ctx.env, 'result', '--job', invalid.jobId);
   assert.equal(invalidResult.evidenceStatus, 'invalid');
   assert.ok(invalidResult.evidence.errors.length > 0);
-  await cli(ctx.env, 'cleanup', '--job', invalid.jobId);
+  await cleanupTracked(ctx, invalid.jobId);
 
   const missingTask = await packet(ctx.base, '[MISSING-EVIDENCE] never write evidence', { evidence: true });
-  const missing = await cli(ctx.env, 'spawn', '--repo', ctx.repo, '--mode', 'acp', '--task', missingTask);
+  const missing = await spawnTracked(ctx, '--repo', ctx.repo, '--mode', 'acp', '--task', missingTask);
   await waitFor(ctx.env, missing.jobId, ['idle']);
   const missingResult = await cli(ctx.env, 'result', '--job', missing.jobId);
   assert.equal(missingResult.evidenceStatus, 'missing');
   assert.equal(missingResult.evidence.items.length, 0);
-  await cli(ctx.env, 'cleanup', '--job', missing.jobId);
+  await cleanupTracked(ctx, missing.jobId);
 });
 
 test('evidence-required headless spawn is rejected', async t => {
   const ctx = await setup(t);
   const task = await packet(ctx.base, 'cannot run headless with evidence', { evidence: true });
   await assert.rejects(
-    cli(ctx.env, 'spawn', '--repo', ctx.repo, '--mode', 'headless', '--task', task),
+    spawnTracked(ctx, '--repo', ctx.repo, '--mode', 'headless', '--task', task),
     /Evidence-required tasks must run in ACP mode/,
   );
 });
@@ -278,7 +343,7 @@ test('evidence-required headless spawn is rejected', async t => {
 test('correction threshold is reported while further followups stay allowed', async t => {
   const ctx = await setup(t, fakeAcp);
   const first = await packet(ctx.base, 'plain acp task');
-  const spawned = await cli(ctx.env, 'spawn', '--repo', ctx.repo, '--mode', 'acp', '--task', first);
+  const spawned = await spawnTracked(ctx, '--repo', ctx.repo, '--mode', 'acp', '--task', first);
   await waitFor(ctx.env, spawned.jobId, ['idle']);
   let result = await cli(ctx.env, 'result', '--job', spawned.jobId);
   assert.equal(result.correctionCount, 0);
@@ -301,5 +366,5 @@ test('correction threshold is reported while further followups stay allowed', as
   assert.equal(result.correctionCount, 3);
   assert.equal(result.correctionLimitReached, true);
   assert.equal(result.trace.complete, true);
-  await cli(ctx.env, 'cleanup', '--job', spawned.jobId);
+  await cleanupTracked(ctx, spawned.jobId);
 });

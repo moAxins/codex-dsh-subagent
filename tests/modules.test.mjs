@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -13,6 +13,61 @@ import {
   EVIDENCE_KINDS, EVIDENCE_SCHEMA_VERSION, INVALID, MISSING, NOT_REQUIRED, READY,
   readEvidence, requirements, validateItem, validateParsed,
 } from '../skills/deepseek-subagent/scripts/lib/evidence.mjs';
+import { writeJsonAtomic } from '../skills/deepseek-subagent/scripts/lib/common.mjs';
+import {
+  TRANSIENT_FILE_ERROR_CODES, TRANSIENT_RETRY_DELAYS_MS, createRecoverableSerialQueue,
+  retryTransientFileOperation,
+} from '../skills/deepseek-subagent/scripts/lib/reliability.mjs';
+
+test('transient file operations retry with the production schedule', async () => {
+  assert.deepEqual(TRANSIENT_FILE_ERROR_CODES, ['EACCES', 'EBUSY', 'EPERM']);
+  assert.deepEqual(TRANSIENT_RETRY_DELAYS_MS, [10, 20, 40, 80, 160, 320, 640]);
+
+  let transientAttempts = 0;
+  const result = await retryTransientFileOperation(async () => {
+    transientAttempts += 1;
+    if (transientAttempts < 4) throw Object.assign(new Error('temporarily locked'), { code: 'EPERM' });
+    return 'written';
+  }, [0, 0, 0]);
+  assert.equal(result, 'written');
+  assert.equal(transientAttempts, 4);
+
+  let permanentAttempts = 0;
+  await assert.rejects(retryTransientFileOperation(async () => {
+    permanentAttempts += 1;
+    throw Object.assign(new Error('invalid path'), { code: 'EINVAL' });
+  }, [0, 0, 0]), /invalid path/);
+  assert.equal(permanentAttempts, 1);
+});
+
+test('recoverable serial queue preserves order after a rejected write', async () => {
+  const enqueue = createRecoverableSerialQueue();
+  const order = [];
+  const failed = enqueue(async () => {
+    order.push('first');
+    throw new Error('state write failed');
+  });
+  const recovered = enqueue(async () => {
+    order.push('second');
+    return 'failed state persisted';
+  });
+
+  await assert.rejects(failed, /state write failed/);
+  assert.equal(await recovered, 'failed state persisted');
+  assert.deepEqual(order, ['first', 'second']);
+});
+
+test('atomic JSON writes replace the state and clean temporary files', async t => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'atomic-state-'));
+  t.after(async () => { await rm(base, { recursive: true, force: true }); });
+  const file = path.join(base, 'state.json');
+  await writeFile(file, '{"status":"running"}\n', 'utf8');
+
+  await writeJsonAtomic(file, { status: 'failed', error: 'state write recovered' });
+
+  assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), { status: 'failed', error: 'state write recovered' });
+  assert.deepEqual((await readdir(base)).filter(name => name.endsWith('.tmp')), []);
+});
 
 test('policy centralizes limits, modes, and task validation', () => {
   assert.equal(MAX_CONCURRENT_JOBS, 3);
